@@ -147,7 +147,7 @@ make_udf_expr_and_func!(
     )
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct ArrayMin {
+pub struct ArrayMin {
     signature: Signature,
 }
 
@@ -158,7 +158,7 @@ impl Default for ArrayMin {
 }
 
 impl ArrayMin {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             signature: Signature::array(Volatility::Immutable),
         }
