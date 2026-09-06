@@ -26,6 +26,10 @@ use super::metrics::{
     MetricsSet, SplitMetrics,
 };
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
+use crate::filter_pushdown::{
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
 use crate::stream::{BatchSplitStream, EmptyRecordBatchStream, ObservedStream};
 use crate::{
     ChildrenPropertiesMode, DisplayFormatType, Distribution, ExecutionPlan,
@@ -45,6 +49,7 @@ use arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::cmp::lt;
 use async_trait::async_trait;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, HashMap, HashSet, Result, UnnestOptions, exec_datafusion_err, exec_err,
@@ -326,6 +331,57 @@ impl ExecutionPlan for UnnestExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        // Filters that reference only non-unnested (passthrough) columns commute
+        // with the unnest. Non-unnest values values are replicated onto every row
+        // produced from an input row, so dropping an input row before the unnest
+        // removes exactly the output rows the filter would have dropped after it.
+        // Filters referencing unnested list/struct columns must stay above this
+        // node.
+        let input_schema = self.input.schema();
+        let unnested_input_indices: HashSet<usize> = self
+            .list_column_indices
+            .iter()
+            .map(|list_unnest| list_unnest.index_in_input_schema)
+            .chain(self.struct_column_indices.iter().copied())
+            .collect();
+
+        // Output indices of passthrough columns, resolved by name the same way
+        // `compute_properties` builds its projection mapping.
+        let allowed_output_indices: std::collections::HashSet<usize> =
+            (0..input_schema.fields().len())
+                .filter(|input_idx| !unnested_input_indices.contains(input_idx))
+                .filter_map(|input_idx| {
+                    let name = input_schema.field(input_idx).name();
+                    self.schema
+                        .fields()
+                        .iter()
+                        .position(|output_field| output_field.name() == name)
+                })
+                .collect();
+
+        let child = ChildFilterDescription::from_child_with_allowed_indices(
+            &parent_filters,
+            allowed_output_indices,
+            &self.input,
+        )?;
+        Ok(FilterDescription::new().with_child(child))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
     #[cfg(feature = "proto")]
